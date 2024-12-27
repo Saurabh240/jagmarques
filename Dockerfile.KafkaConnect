@@ -1,0 +1,7 @@
+FROM confluentinc/cp-kafka-connect-base:latest
+
+# Install Kafka Connect JDBC and other plugins
+RUN confluent-hub install --no-prompt confluentinc/kafka-connect-jdbc:10.2.1
+RUN confluent-hub install --no-prompt jcustenborder/kafka-connect-transform-common:0.1.0.58
+
+ENV CONNECT_PLUGIN_PATH="/usr/share/java,/usr/share/confluent-hub-components"
