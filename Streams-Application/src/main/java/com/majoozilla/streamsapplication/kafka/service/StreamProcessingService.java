@@ -3,42 +3,46 @@ package com.majoozilla.streamsapplication.kafka.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.majoozilla.streamsapplication.StreamsApplication;
 import com.majoozilla.streamsapplication.database.Database;
 import com.majoozilla.streamsapplication.kafka.KeyValueSerde;
 import com.majoozilla.streamsapplication.kafka.KeyValueSerdeLong;
 import com.majoozilla.streamsapplication.models.Route;
 import com.majoozilla.streamsapplication.models.Trip;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.KeyValue;
+
 import org.apache.kafka.streams.kstream.*;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.state.KeyValueStore;
-
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
-import java.sql.Timestamp;
-import java.time.Duration;
-import java.util.UUID;
-
 import org.apache.kafka.streams.state.WindowStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.support.serializer.JsonSerde;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.util.*;
 
 public class StreamProcessingService {
 
 
     private static final Logger logger = LoggerFactory.getLogger(StreamProcessingService.class);
     private static final String RESULTS_TOPIC = "Results";
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final KafkaProducer<String, String> producer = new KafkaProducer<>(getProducerProperties());
     static Serde<Trip> tripSerde = new JsonSerde<>(Trip.class);
     static Serde<Route> routeSerde = new JsonSerde<>(Route.class);
     static Serde<KeyValue<String, Double>> keyValueSerde = KeyValueSerde.getKeyValueSerde();
     static Serde<KeyValue<String, Long>> keyValueSerdeLong = new KeyValueSerdeLong();
-
 
     public static void PassengerWithMostTrips(KStream<String, Trip> trips) {
         KStream<String, Trip> passengerTrips = trips.map((key, trip) -> {
@@ -83,31 +87,68 @@ public class StreamProcessingService {
         passengerWithMostTrips.foreach((passengerName, tripCount) -> {
             logger.info("Passenger with most trips: {} with {} trips", passengerName, tripCount);
 
-           
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp, passengerName) " +
-                                 "VALUES (?, ?, ?, ?, ?)")) {
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "PassengerWithMostTrips";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                UUID metricID = UUID.randomUUID();
-                String metricType = "PassengerWithMostTrips";
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", (float) tripCount);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", 0);
+            payload.put("transporttype", "");
+            payload.put("operatorname", "");
+            payload.put("passengername", passengerName);
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setLong(3, tripCount);
-                stmt.setTimestamp(4, timestamp);
-                stmt.setString(5, passengerName);
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "float"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
 
-                stmt.executeUpdate();
-                logger.info("Successfully stored passenger with most trips: {}", passengerName);
-            } catch (SQLException e) {
-                logger.error("Failed to write passenger with most trips to database", e);
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+            try {
+                    JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                    String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
+         // Producing the stream to the Kafka topic
         passengerWithMostTrips.to(RESULTS_TOPIC, Produced.with(Serdes.String(), Serdes.Long()));
-
     }
 
     public static void OperatorWithMaxOccupancy(KStream<String, Trip> trips) {
@@ -160,25 +201,63 @@ public class StreamProcessingService {
         operatorWithMaxOccupancy.toStream().foreach((key, value) -> {
             logger.info("Operator with Max Occupancy - Operator: {}, Occupancy: {}", value.key, value.value);
 
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp, operatorName) " +
-                                 "VALUES (?, ?, ?, ?, ?)")) {
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "OperatorWithMaxOccupancy";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                UUID metricID = UUID.randomUUID();
-                String metricType = "OperatorWithMaxOccupancy";
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", value.value);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", 0);
+            payload.put("transporttype", "");
+            payload.put("operatorname", "");
+            payload.put("passengername", value.key);
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setDouble(3, value.value);
-                stmt.setTimestamp(4, timestamp);
-                stmt.setString(5, value.key);
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
 
-                stmt.executeUpdate();
-                logger.info("Successfully stored operator with max occupancy: {}", value.key);
-            } catch (SQLException e) {
-                logger.error("Failed to write operator with max occupancy to database", e);
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+            try {
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
@@ -225,26 +304,63 @@ public class StreamProcessingService {
             logger.info("Least Occupied Route - Transport Type: {}, Route ID: {}, Occupancy: {}",
                     transportType, routeAndOccupancy.key, routeAndOccupancy.value);
 
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp, routeID, transportType) " +
-                                 "VALUES (?, ?, ?, ?, ?, ?)")) {
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "RoutesWithLeastOccupancyPerTransportType";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                UUID metricID = UUID.randomUUID();
-                String metricType = "RoutesWithLeastOccupancyPerTransportType";
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", routeAndOccupancy.value);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", Integer.parseInt(routeAndOccupancy.key));
+            payload.put("transporttype", transportType);
+            payload.put("operatorname", "");
+            payload.put("passengername", "");
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setDouble(3, routeAndOccupancy.value);
-                stmt.setTimestamp(4, timestamp);
-                stmt.setInt(5, Integer.parseInt(routeAndOccupancy.key));
-                stmt.setString(6, transportType); 
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
 
-                stmt.executeUpdate();
-                logger.info("Successfully stored least occupied route for transport type: {}", transportType);
-            } catch (SQLException e) {
-                logger.error("Failed to write least occupied route to database", e);
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+            try {
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
@@ -289,29 +405,65 @@ public class StreamProcessingService {
         maxTransportType.toStream().foreach((key, value) -> {
             logger.info("Transport Type with Max Passengers: {}, Passengers: {}", key, value);
 
-           
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp, transportType) " +
-                                 "VALUES (?, ?, ?, ?, ?)")) {
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "TransportTypeWithMaxPassengers";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                UUID metricID = UUID.randomUUID();  
-                String metricType = "TransportTypeWithMaxPassengers";
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", value);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", 0);
+            payload.put("transporttype", key);
+            payload.put("operatorname", "");
+            payload.put("passengername", "");
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setInt(3, value);
-                stmt.setTimestamp(4, timestamp);
-                stmt.setString(5, key);  
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
 
-                stmt.executeUpdate();
-                logger.info("Successfully stored max passengers transport type: {}", key);
-            } catch (SQLException e) {
-                logger.error("Failed to write max passengers transport type to database", e);
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+            try {
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
-
 
         maxTransportType.toStream().to(RESULTS_TOPIC, Produced.with(Serdes.String(), Serdes.Integer()));
     }
@@ -365,25 +517,63 @@ public class StreamProcessingService {
         averagePassengersPerTransportType.toStream().foreach((key, value) -> {
             logger.info("Average Passengers Per Transport Type - Type: {}, Average: {}", key, value);
 
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp, transportType) " +
-                                 "VALUES (?, ?, ?, ?, ?)")) {
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "AveragePassengersPerTransportType";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                UUID metricID = UUID.randomUUID();
-                String metricType = "AveragePassengersPerTransportType";
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", value);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", 0);
+            payload.put("transporttype", key);
+            payload.put("operatorname", "");
+            payload.put("passengername", "");
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setDouble(3, value);
-                stmt.setTimestamp(4, timestamp);
-                stmt.setString(5, key);  
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
 
-                stmt.executeUpdate();
-                logger.info("Successfully stored average passengers for transport type: {}", key);
-            } catch (SQLException e) {
-                logger.error("Failed to write average passengers for transport type to database", e);
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+            try {
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
@@ -445,24 +635,63 @@ public class StreamProcessingService {
         totalOccupancyPercentageOcc.toStream().foreach((key, value) -> {
             logger.info("Total Occupancy Percentage: {}", value);
 
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp) " +
-                                 "VALUES (?, ?, ?, ?)")) {
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "TotalOccupancyPercentageForAllRoutes";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                UUID metricID = UUID.randomUUID();
-                String metricType = "TotalOccupancyPercentageForAllRoutes";
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", value);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", 0);
+            payload.put("transporttype", "");
+            payload.put("operatorname", "");
+            payload.put("passengername", "");
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setDouble(3, value);
-                stmt.setTimestamp(4, timestamp);
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
 
-                stmt.executeUpdate();
-                logger.info("Successfully stored total occupancy percentage: {}", value);
-            } catch (SQLException e) {
-                logger.error("Failed to write total occupancy percentage to database", e);
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+            try {
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
@@ -479,24 +708,64 @@ public class StreamProcessingService {
 
 
         totalCapacity.toStream().foreach((key, value) -> {
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp) " +
-                                 "VALUES (?, ?, ?, ?)")) {
 
-                UUID metricID = UUID.randomUUID();
-                String metricType = "TotalSeatingCapacityForAllRoutes";
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "TotalSeatingCapacityForAllRoutes";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setInt(3, value);
-                stmt.setTimestamp(4, timestamp);
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", value);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", 0);
+            payload.put("transporttype", "");
+            payload.put("operatorname", "");
+            payload.put("passengername", "");
 
-                stmt.executeUpdate();
-                logger.info("Successfully updated total seating capacity: {}", value);
-            } catch (SQLException e) {
-                logger.error("Failed to write total seating capacity to database", e);
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
+
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+            try {
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
@@ -520,28 +789,63 @@ public class StreamProcessingService {
         totalPassengers.toStream().foreach((key, value) -> {
             logger.info("Updated total passengers: {}. Current total: {}", key, value);
 
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp) " +
-                                 "VALUES (?, ?, ?, ?)")) {
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "TotalPassengersForAllTrips";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                UUID metricID = UUID.randomUUID();  
-                String metricType = "TotalPassengersForAllTrips";
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", value);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", 0);
+            payload.put("transporttype", "");
+            payload.put("operatorname", "");
+            payload.put("passengername", "");
 
-                logger.info("Preparing to insert total passengers into the database: metricID = {}, metricType = {}, value = {}, timestamp = {}",
-                        metricID, metricType, value, timestamp);
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setInt(3, value);
-                stmt.setTimestamp(4, timestamp);
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
 
-                stmt.executeUpdate();
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
 
-                logger.info("Successfully updated total passengers in database with value: {}", value);
-            } catch (SQLException e) {
-                logger.error("Failed to write total passengers to database. Error: {}", e.getMessage(), e);
+            try {
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
@@ -610,31 +914,66 @@ public class StreamProcessingService {
 
         occupancyMetrics.foreach((key, value) -> {
             JsonNode json = null;
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp, routeID, transportType) " +
-                                 "VALUES (?, ?, ?, ?, ?, ?)")) {
-
+            try {
                 json = new ObjectMapper().readTree(value);
-                UUID metricID = UUID.randomUUID();  
-                String metricType = "OccupancyPercentagePerTrip";
-                double valueField = json.has("occupancyPercentage") ? json.get("occupancyPercentage").asDouble() : 0.0;
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+            // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "OccupancyPercentagePerTrip";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
+            double valueField = json.has("occupancyPercentage") ? json.get("occupancyPercentage").asDouble() : 0.0;
 
-                logger.info("Preparing to insert occupancy percentage for tripId {}: {}", json.get("tripId").asText(), valueField);
+            // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", valueField);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", json.has("routeId") ? json.get("routeId").asInt() : 0);
+            payload.put("transporttype", json.get("transportType").asText());
+            payload.put("operatorname", "");
+            payload.put("passengername", "");
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setDouble(3, valueField);
-                stmt.setTimestamp(4, timestamp);
-                int routeId = json.has("routeId") ? json.get("routeId").asInt() : 0;
-                stmt.setInt(5, routeId);
-                stmt.setString(6, json.get("transportType").asText());
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
 
-                stmt.executeUpdate();
-                logger.info("Successfully updated occupancy percentage for tripId {}: {}", json.get("tripId").asText(), valueField);
-            } catch (SQLException | JsonProcessingException e) {
-                logger.error("Failed to write occupancy percentage to database for tripId {}", json != null ? json.get("tripId").asText() : "Unknown", e);
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
@@ -647,37 +986,68 @@ public class StreamProcessingService {
             if (route != null) {
                 logger.info("Processing route with routeId {}: origin = {}, destination = {}, capacity = {}, transportType = {}",
                         routeId, route.getOrigin(), route.getDestination(), route.getCapacity(), route.getTransportType());
+               // Generating dynamic values
+                UUID metricId = UUID.randomUUID();
+                String metricType = "AvailableSeatsPerRoute";
+                String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                try (Connection conn = Database.getConnection();
-                     PreparedStatement stmt = conn.prepareStatement(
-                             "INSERT INTO metrics (metricID, metricType, value, timestamp, routeID, transportType) " +
-                                     "VALUES (?, ?, ?, ?, ?, ?)")) {
+                // Constructing the payload
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("metricid", metricId.toString());
+                payload.put("metrictype", metricType);
+                payload.put("value", route.getCapacity());
+                payload.put("timestamp", timestamp);
+                payload.put("routeid", route.getId());
+                payload.put("transporttype", route.getTransportType());
+                payload.put("operatorname", "");
+                payload.put("passengername", "");
 
-                    UUID metricID = UUID.randomUUID();  
-                    String metricType = "AvailableSeatsPerRoute";
-                    double valueField = route.getCapacity();
-                    Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+                // Constructing the schema
+                List<Map<String, Object>> fields = Arrays.asList(
+                        Map.of("field", "metricid", "type", "string"),
+                        Map.of("field", "metrictype", "type", "string"),
+                        Map.of("field", "value", "type", "double"),
+                        Map.of("field", "timestamp", "type", "string"),
+                        Map.of("field", "routeid", "type", "int32"),
+                        Map.of("field", "transporttype", "type", "string"),
+                        Map.of("field", "operatorname", "type", "string"),
+                        Map.of("field", "passengername", "type", "string")
+                );
 
-                    stmt.setObject(1, metricID);
-                    stmt.setString(2, metricType);
-                    stmt.setDouble(3, valueField);
-                    stmt.setTimestamp(4, timestamp);
-                    stmt.setLong(5, route.getId());
-                    stmt.setString(6, route.getTransportType());
+                Map<String, Object> schema = new HashMap<>();
+                schema.put("type", "struct");
+                schema.put("fields", fields);
+                schema.put("optional", false);
+                schema.put("name", "Metrics");
 
-                    stmt.executeUpdate();
+                // Combining schema and payload into the final message
+                Map<String, Object> message = new HashMap<>();
+                message.put("schema", schema);
+                message.put("payload", payload);
 
-                    logger.info("Successfully updated available seats for routeID {} with capacity: {}", routeId, route.getCapacity());
-                } catch (SQLException e) {
-                    logger.error("Database error when updating available seats for routeID {}: {}", routeId, e.getMessage(), e);
+                try {
+                    JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                    String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                    // Publish the message to Kafka
+                    ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                    producer.send(record, (metadata, exception) -> {
+                        if (exception != null) {
+                            logger.error("Failed to publish message to topic", exception);
+                        } else {
+                            logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                        }
+                    });
+
+                } catch (JsonProcessingException e) {
+                    logger.error("Failed to serialize message to JSON", e);
+                } catch (Exception e) {
+                    logger.error("Error while creating or publishing message to Kafka topic", e);
                 }
-            } else {
-                logger.warn("Received null route for routeId {}", routeId);
             }
-        });
 
         routesStream.to(RESULTS_TOPIC, Produced.with(Serdes.String(), routeSerde));
-
+        });
     }
 
     public static void TotalPassengersPerRoute(KStream<String, Trip> trips, KTable<String, Route> routesTable) {
@@ -724,32 +1094,66 @@ public class StreamProcessingService {
         enrichedMetrics.foreach((key, value) -> logger.info("Enriched Metric: {}", value));
 
         enrichedMetrics.foreach((key, value) -> {
-            try (Connection conn = Database.getConnection();
-                 PreparedStatement stmt = conn.prepareStatement(
-                         "INSERT INTO metrics (metricID, metricType, value, timestamp, routeID, transportType) " +
-                                 "VALUES (?, ?, ?, ?, ?, ?)")) {
+            try {
+           // Generating dynamic values
+            UUID metricId = UUID.randomUUID();
+            String metricType = "TotalPassengersPerRoute";
+            String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                JsonNode json = new ObjectMapper().readTree(value);
-                UUID metricID = UUID.randomUUID();  
-                String metricType = "TotalPassengersPerRoute";
-                double valueField = json.get("totalPassengers").asDouble();
-                Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+                 JsonNode json = new ObjectMapper().readTree(value);
+                 double valueField = json.get("totalPassengers").asDouble();
 
-                stmt.setObject(1, metricID);
-                stmt.setString(2, metricType);
-                stmt.setDouble(3, valueField);
-                stmt.setTimestamp(4, timestamp);
-                if (json.hasNonNull("routeID")) {
-                    stmt.setInt(5, json.get("routeID").asInt());
-                } else {
-                    stmt.setNull(5, java.sql.Types.INTEGER);
-                }
-                stmt.setString(6, json.hasNonNull("transportType") ? json.get("transportType").asText() : "Unknown");
+                // Constructing the payload
+            Map<String, Object> payload = new HashMap<>();
+            payload.put("metricid", metricId.toString());
+            payload.put("metrictype", metricType);
+            payload.put("value", valueField);
+            payload.put("timestamp", timestamp);
+            payload.put("routeid", json.get("routeID").asInt());
+            payload.put("transporttype", json.hasNonNull("transportType") ? json.get("transportType").asText() : "Unknown");
+            payload.put("operatorname", "");
+            payload.put("passengername", "");
 
-                stmt.executeUpdate();
-                logger.info("Successfully inserted/updated metric for routeID {}", key);
-            } catch (SQLException | JsonProcessingException e) {
-                logger.error("Failed to write metric to database for key {}", key, e);
+            // Constructing the schema
+            List<Map<String, Object>> fields = Arrays.asList(
+                    Map.of("field", "metricid", "type", "string"),
+                    Map.of("field", "metrictype", "type", "string"),
+                    Map.of("field", "value", "type", "double"),
+                    Map.of("field", "timestamp", "type", "string"),
+                    Map.of("field", "routeid", "type", "int32"),
+                    Map.of("field", "transporttype", "type", "string"),
+                    Map.of("field", "operatorname", "type", "string"),
+                    Map.of("field", "passengername", "type", "string")
+            );
+
+            Map<String, Object> schema = new HashMap<>();
+            schema.put("type", "struct");
+            schema.put("fields", fields);
+            schema.put("optional", false);
+            schema.put("name", "Metrics");
+
+            // Combining schema and payload into the final message
+            Map<String, Object> message = new HashMap<>();
+            message.put("schema", schema);
+            message.put("payload", payload);
+
+                JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                // Publish the message to Kafka
+                ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                producer.send(record, (metadata, exception) -> {
+                    if (exception != null) {
+                        logger.error("Failed to publish message to topic", exception);
+                    } else {
+                        logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                    }
+                });
+
+            } catch (JsonProcessingException e) {
+                logger.error("Failed to serialize message to JSON", e);
+            } catch (Exception e) {
+                logger.error("Error while creating or publishing message to Kafka topic", e);
             }
         });
 
@@ -784,30 +1188,65 @@ public class StreamProcessingService {
 
                     logger.info("Most used transport type: {}, Count: {}", transportType, count);
 
+// Generating dynamic values
+        UUID metricId = UUID.randomUUID();
+        String metricType = "MostUsedTransportTypeInLastHour";
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                    try (Connection conn = Database.getConnection();
-                         PreparedStatement stmt = conn.prepareStatement(
-                                 "INSERT INTO metrics (metricID, metricType, value, timestamp, transportType) " +
-                                         "VALUES (?, ?, ?, ?, ?)")) {
+        // Constructing the payload
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("metricid", metricId.toString());
+        payload.put("metrictype", metricType);
+        payload.put("value", count);
+        payload.put("timestamp", timestamp);
+        payload.put("routeid", 0);
+        payload.put("transporttype", transportType);
+        payload.put("operatorname", "");
+        payload.put("passengername", "");
 
-                        UUID metricID = UUID.randomUUID();
-                        String metricType = "MostUsedTransportTypeInLastHour";
-                        Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+        // Constructing the schema
+        List<Map<String, Object>> fields = Arrays.asList(
+                Map.of("field", "metricid", "type", "string"),
+                Map.of("field", "metrictype", "type", "string"),
+                Map.of("field", "value", "type", "double"),
+                Map.of("field", "timestamp", "type", "string"),
+                Map.of("field", "routeid", "type", "int32"),
+                Map.of("field", "transporttype", "type", "string"),
+                Map.of("field", "operatorname", "type", "string"),
+                Map.of("field", "passengername", "type", "string")
+        );
 
-                        stmt.setObject(1, metricID);
-                        stmt.setString(2, metricType);
-                        stmt.setLong(3, count);
-                        stmt.setTimestamp(4, timestamp);
-                        stmt.setString(5, transportType);
+        Map<String, Object> schema = new HashMap<>();
+        schema.put("type", "struct");
+        schema.put("fields", fields);
+        schema.put("optional", false);
+        schema.put("name", "Metrics");
 
-                        stmt.executeUpdate();
-                        logger.info("Successfully stored most used transport type: {} with count: {}", transportType, count);
-                    } catch (SQLException e) {
-                        logger.error("Failed to write most used transport type to database", e);
-                    }
-                });
+        // Combining schema and payload into the final message
+        Map<String, Object> message = new HashMap<>();
+        message.put("schema", schema);
+        message.put("payload", payload);
 
+        try {
+            JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+            String jsonMessage = objectMapper.writeValueAsString(jsonNode);
 
+            // Publish the message to Kafka
+            ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+            producer.send(record, (metadata, exception) -> {
+                if (exception != null) {
+                    logger.error("Failed to publish message to topic", exception);
+                } else {
+                    logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                }
+            });
+
+        } catch (JsonProcessingException e) {
+            logger.error("Failed to serialize message to JSON", e);
+        } catch (Exception e) {
+            logger.error("Error while creating or publishing message to Kafka topic", e);
+        }
+    });
         windowedCounts.toStream()
                 .map((key, value) -> KeyValue.pair(key.key(), value.toString()))
                 .to(RESULTS_TOPIC, Produced.with(Serdes.String(), Serdes.String()));
@@ -847,25 +1286,63 @@ public class StreamProcessingService {
 
                     logger.info("Least occupied transport type: {}, Occupancy: {}", transportType, occupancyPercentage);
 
-                    try (Connection conn = Database.getConnection();
-                         PreparedStatement stmt = conn.prepareStatement(
-                                 "INSERT INTO metrics (metricID, metricType, value, timestamp, transportType) " +
-                                         "VALUES (?, ?, ?, ?, ?)")) {
+                    // Generating dynamic values
+                    UUID metricId = UUID.randomUUID();
+                    String metricType = "LeastOccupiedTransportTypeInLastHour";
+                    String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()); // Dynamic timestamp
 
-                        UUID metricID = UUID.randomUUID(); // Generate a unique metric ID
-                        String metricType = "LeastOccupiedTransportTypeInLastHour";
-                        Timestamp timestamp = new Timestamp(System.currentTimeMillis());
+                    // Constructing the payload
+                    Map<String, Object> payload = new HashMap<>();
+                    payload.put("metricid", metricId.toString());
+                    payload.put("metrictype", metricType);
+                    payload.put("value", occupancyPercentage);
+                    payload.put("timestamp", timestamp);
+                    payload.put("routeid", 0);
+                    payload.put("transporttype", transportType);
+                    payload.put("operatorname", "");
+                    payload.put("passengername", "");
 
-                        stmt.setObject(1, metricID);
-                        stmt.setString(2, metricType);
-                        stmt.setDouble(3, occupancyPercentage);
-                        stmt.setTimestamp(4, timestamp);
-                        stmt.setString(5, transportType);
+                    // Constructing the schema
+                    List<Map<String, Object>> fields = Arrays.asList(
+                            Map.of("field", "metricid", "type", "string"),
+                            Map.of("field", "metrictype", "type", "string"),
+                            Map.of("field", "value", "type", "double"),
+                            Map.of("field", "timestamp", "type", "string"),
+                            Map.of("field", "routeid", "type", "int32"),
+                            Map.of("field", "transporttype", "type", "string"),
+                            Map.of("field", "operatorname", "type", "string"),
+                            Map.of("field", "passengername", "type", "string")
+                    );
 
-                        stmt.executeUpdate();
-                        logger.info("Successfully stored least occupied transport type: {} with occupancy: {}", transportType, occupancyPercentage);
-                    } catch (SQLException e) {
-                        logger.error("Failed to write least occupied transport type to database", e);
+                    Map<String, Object> schema = new HashMap<>();
+                    schema.put("type", "struct");
+                    schema.put("fields", fields);
+                    schema.put("optional", false);
+                    schema.put("name", "Metrics");
+
+                    // Combining schema and payload into the final message
+                    Map<String, Object> message = new HashMap<>();
+                    message.put("schema", schema);
+                    message.put("payload", payload);
+
+                    try {
+                        JsonNode jsonNode = objectMapper.valueToTree(message); // Converts safely to a JSON tree structure
+                        String jsonMessage = objectMapper.writeValueAsString(jsonNode);
+
+                        // Publish the message to Kafka
+                        ProducerRecord<String, String> record = new ProducerRecord<>(RESULTS_TOPIC, null, jsonMessage);
+                        producer.send(record, (metadata, exception) -> {
+                            if (exception != null) {
+                                logger.error("Failed to publish message to topic", exception);
+                            } else {
+                                logger.info("Message published to topic {} with offset {}", metadata.topic(), metadata.offset());
+                            }
+                        });
+
+                    } catch (JsonProcessingException e) {
+                        logger.error("Failed to serialize message to JSON", e);
+                    } catch (Exception e) {
+                        logger.error("Error while creating or publishing message to Kafka topic", e);
                     }
                 });
 
@@ -874,5 +1351,12 @@ public class StreamProcessingService {
                 .to(RESULTS_TOPIC, Produced.with(Serdes.String(), Serdes.String()));
     }
 
-
+    // Helper method to get Kafka producer properties
+    private static Properties getProducerProperties() {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        return props;
+    }
 }

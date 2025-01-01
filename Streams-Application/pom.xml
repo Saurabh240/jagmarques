@@ -84,6 +84,10 @@
             <artifactId>HikariCP</artifactId>
             <version>6.2.1</version>
         </dependency>
+        <dependency>
+            <groupId>org.hibernate.orm</groupId>
+            <artifactId>hibernate-core</artifactId>
+        </dependency>
 
 
     </dependencies>

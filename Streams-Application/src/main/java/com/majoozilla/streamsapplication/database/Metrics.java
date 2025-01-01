@@ -1,9 +1,10 @@
 package com.majoozilla.streamsapplication.database;
 
 import java.util.Date;
+import java.util.UUID;
 
 public class Metrics {
-    private int metricID;
+    private UUID metricID;
     private String metricType;
     private double value;
     private Date timestamp;
@@ -17,7 +18,7 @@ public class Metrics {
     public Metrics() {
     }
 
-    public Metrics(int metricID, String metricType, double value, Date timestamp, Integer routeID, String transportType, String operatorName, String passengerName) {
+    public Metrics(UUID metricID, String metricType, double value, Date timestamp, Integer routeID, String transportType, String operatorName, String passengerName) {
         this.metricID = metricID;
         this.metricType = metricType;
         this.value = value;
@@ -30,11 +31,11 @@ public class Metrics {
 
     // Getters and setters for each field
 
-    public int getMetricID() {
+    public UUID getMetricID() {
         return metricID;
     }
 
-    public void setMetricID(int metricID) {
+    public void setMetricID(UUID metricID) {
         this.metricID = metricID;
     }
 
